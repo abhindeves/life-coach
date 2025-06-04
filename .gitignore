@@ -1,0 +1,18 @@
+# Python-specific ignores
+__pycache__/
+*.pyc
+*.pyd
+.Python
+env/
+venv/
+.env
+
+# OS-specific ignores
+.DS_Store
+.vscode/
+
+# Sensitive data (important!)
+config.py
+secrets.py
+# Or if you keep your token and credentials directly in the main file
+# Consider externalizing them into a separate file not committed to Git
