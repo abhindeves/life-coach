@@ -15,6 +15,7 @@ TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 
 def main():
     print("Hello from coach!")
+    print("Lets start making LLM Integration!!")
 
 if __name__ == "__main__":
     main()
