@@ -2,6 +2,7 @@ import datetime
 import os
 import uuid
 import asyncio
+import logging
 from enum import Enum, auto
 from urllib.parse import quote_plus
 from collections import defaultdict
@@ -12,6 +13,16 @@ from telegram.ext import (
     ApplicationBuilder, CommandHandler, MessageHandler, ContextTypes, filters
 )
 import google.generativeai as genai
+
+# Configure logging
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
+    handlers=[
+        logging.StreamHandler()
+    ]
+)
+logger = logging.getLogger(__name__)
 
 # --- Load environment variables ---
 load_dotenv()
@@ -33,9 +44,9 @@ try:
     client = MongoClient(uri)
     db = client[DB_NAME]
     journal_collection = db[COLLECTION_NAME]
-    print("Successfully connected to MongoDB!")
+    logger.info("Successfully connected to MongoDB!")
 except Exception as e:
-    print(f"Error connecting to MongoDB: {e}")
+    logger.error(f"Error connecting to MongoDB: {e}")
     exit()
 
 # --- FSM State Enum ---
@@ -69,7 +80,7 @@ def generate_reply_from_gemini(user_input: str, conversation_history: list = Non
         response = model.generate_content(user_input)
         return response.text.strip()
     except Exception as e:
-        print(f"Error generating reply from Gemini: {e}")
+        logger.error(f"Error generating reply from Gemini: {e}")
         return "Sorry, I'm having trouble coming up with a response right now."
 
 # --- Helper function to get conversation history ---
@@ -81,7 +92,7 @@ def get_episode_history(episode_id: str) -> list:
             return episode["messages"]
         return []
     except Exception as e:
-        print(f"Error retrieving episode history: {e}")
+        logger.error(f"Error retrieving episode history: {e}")
         return []
 
 # --- FSM Transition Handler ---
@@ -122,13 +133,13 @@ def transition_state(user_id, username, event):
 
 # --- Background Task to Monitor Timeouts ---
 async def monitor_idle_users():
-    print("Starting user idle monitoring...")
+    logger.info("Starting user idle monitoring...")
     while True:
         now = datetime.datetime.now(datetime.timezone.utc)
         for user_id, info in list(user_states.items()):
             if info["state"] in [EpisodeState.ACTIVE, EpisodeState.AWAITING_END]:
                 if now - info["last_activity"] > IDLE_TIMEOUT:
-                    print(f"User {user_id} timed out, transitioning state...")
+                    logger.info(f"User {user_id} timed out, transitioning state...")
                     transition_state(user_id, None, "timeout")
         await asyncio.sleep(60)  # Check every minute
 
@@ -191,7 +202,7 @@ async def main():
         await app.initialize()
         await app.start()
         
-        print("Bot is starting...")
+        logger.info("Bot is starting...")
         
         # Start polling for updates
         await app.updater.start_polling()
@@ -200,7 +211,7 @@ async def main():
         await asyncio.Event().wait()
         
     except KeyboardInterrupt:
-        print("Bot stopped by user")
+        logger.info("Bot stopped by user")
     finally:
         # Clean shutdown
         monitor_task.cancel()
