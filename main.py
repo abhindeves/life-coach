@@ -49,15 +49,40 @@ class EpisodeState(Enum):
 user_states = defaultdict(dict)
 IDLE_TIMEOUT = datetime.timedelta(minutes=30)
 
-# --- Gemini Response Generator ---
-def generate_reply_from_gemini(user_input: str) -> str:
+# --- Gemini Response Generator with Working Memory ---
+def generate_reply_from_gemini(user_input: str, conversation_history: list = None) -> str:
     try:
-        model = genai.GenerativeModel('gemini-1.5-flash', system_instruction="Act as a life coach. Provide thoughtful and empathetic responses to user queries.")
+        # Build conversation context
+        context_prompt = "Act as a life coach. Provide thoughtful and empathetic responses to user queries."
+        
+        if conversation_history and len(conversation_history) > 0:
+            context_prompt += "\n\nHere's the conversation history from this session:\n"
+            for msg in conversation_history:
+                sender = "User" if msg["sender"] == "user" else "Assistant"
+                timestamp = msg["timestamp"].strftime("%H:%M")
+                context_prompt += f"[{timestamp}] {sender}: {msg['text']}\n"
+            context_prompt += f"\nNow respond to the user's latest message: {user_input}"
+        else:
+            context_prompt += f"\n\nUser message: {user_input}"
+        
+        model = genai.GenerativeModel('gemini-1.5-flash', system_instruction=context_prompt)
         response = model.generate_content(user_input)
         return response.text.strip()
     except Exception as e:
         print(f"Error generating reply from Gemini: {e}")
         return "Sorry, I'm having trouble coming up with a response right now."
+
+# --- Helper function to get conversation history ---
+def get_episode_history(episode_id: str) -> list:
+    """Retrieve conversation history for the current episode"""
+    try:
+        episode = journal_collection.find_one({"episode_id": episode_id})
+        if episode and "messages" in episode:
+            return episode["messages"]
+        return []
+    except Exception as e:
+        print(f"Error retrieving episode history: {e}")
+        return []
 
 # --- FSM Transition Handler ---
 def transition_state(user_id, username, event):
@@ -135,8 +160,11 @@ async def save_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         {"$push": {"messages": {"sender": "user", "text": message_text, "timestamp": now}}}
     )
 
-    # Get Gemini reply
-    gemini_reply = generate_reply_from_gemini(message_text)
+    # Get conversation history for working memory
+    conversation_history = get_episode_history(episode_id)
+    
+    # Get Gemini reply with working memory context
+    gemini_reply = generate_reply_from_gemini(message_text, conversation_history)
     await update.message.reply_text(gemini_reply)
 
     # Save bot reply
