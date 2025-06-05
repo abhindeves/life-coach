@@ -3,6 +3,7 @@ import os
 import uuid
 import asyncio
 import logging
+import json
 from enum import Enum, auto
 from urllib.parse import quote_plus
 from collections import defaultdict
@@ -34,6 +35,7 @@ uri = f"mongodb+srv://{username}:{password}@cluster0.xjcfm.mongodb.net/?retryWri
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 DB_NAME = 'life_coach_db'
 COLLECTION_NAME = 'journal_entries'
+MEMORY_COLLECTION_NAME = 'episodic_memories'
 
 # --- Gemini API Configuration ---
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
@@ -44,6 +46,7 @@ try:
     client = MongoClient(uri)
     db = client[DB_NAME]
     journal_collection = db[COLLECTION_NAME]
+    memory_collection = db[MEMORY_COLLECTION_NAME]
     logger.info("Successfully connected to MongoDB!")
 except Exception as e:
     logger.error(f"Error connecting to MongoDB: {e}")
@@ -59,6 +62,191 @@ class EpisodeState(Enum):
 # --- Session Tracker ---
 user_states = defaultdict(dict)
 IDLE_TIMEOUT = datetime.timedelta(minutes=30)
+
+# --- Memory Processing Configuration ---
+MEMORY_BATCH_SIZE = 10  # Process max 10 episodes per cycle
+MEMORY_PROCESSING_INTERVAL = 60  # 1 minutes
+
+# --- Episodic Memory Prompt Template ---
+life_coach_prompt_template = """
+You are analyzing life coaching conversations to create memory reflections that help guide future sessions. Your job is to extract helpful insights that reflect the user's core issues, goals, and what coaching strategies worked or didn't.
+Review the conversation and create a memory reflection with these rules:
+1. Only extract context_tags that are *explicitly mentioned or clearly implied* in the conversation — do not invent or generalize them.
+2. Be extremely concise — each field should be one clear, actionable sentence.
+3. Focus on practical, repeatable coaching insights that would help in similar future sessions.
+4. Use terms or phrases directly from the conversation for context_tags when possible.
+Output only a valid JSON object in this format:
+{{
+    "context_tags": [              // 2–4 keywords or phrases lifted directly from the user's concerns or goals
+        string,
+        ...
+    ],
+    "conversation_summary": string, // One sentence summarizing the user's main concern or progress
+    "what_worked": string,         // The most effective thing said or done in the conversation
+    "what_to_avoid": string        // The least effective or unhelpful moment in the conversation
+}}
+Guidelines:
+- Pull actual keywords or short phrases from the conversation for context_tags, e.g., ["procrastination", "gym_routine", "lack_of_motivation"]
+- Don't use vague tags like ["life_coaching", "feelings", "helpful_talk"]
+- Use direct user quotes or paraphrased terms from the session
+Here is the conversation:
+{conversation}
+"""
+
+# --- Episodic Memory Functions ---
+def format_conversation_for_memory(messages: list) -> str:
+    """Format conversation messages into a readable string for memory processing"""
+    formatted_conversation = ""
+    for msg in messages:
+        sender = "User" if msg["sender"] == "user" else "Coach"
+        timestamp = msg["timestamp"].strftime("%H:%M")
+        formatted_conversation += f"[{timestamp}] {sender}: {msg['text']}\n"
+    return formatted_conversation
+
+def create_episodic_memory(episode_data: dict) -> dict:
+    """Create episodic memory from a completed conversation episode"""
+    try:
+        # Format conversation for analysis
+        conversation_text = format_conversation_for_memory(episode_data.get("messages", []))
+        
+        if not conversation_text.strip():
+            logger.warning(f"Empty conversation for episode {episode_data.get('episode_id')}")
+            return None
+        
+        # Generate memory using Gemini
+        prompt = life_coach_prompt_template.format(conversation=conversation_text)
+        
+        model = genai.GenerativeModel('gemini-1.5-flash')
+        response = model.generate_content(prompt)
+        
+        # Parse JSON response
+        try:
+            memory_data = json.loads(response.text.strip())
+        except json.JSONDecodeError:
+            # Try to extract JSON from response if it's wrapped in other text
+            response_text = response.text.strip()
+            start_idx = response_text.find('{')
+            end_idx = response_text.rfind('}') + 1
+            if start_idx != -1 and end_idx != 0:
+                memory_data = json.loads(response_text[start_idx:end_idx])
+            else:
+                raise
+        
+        # Validate required fields
+        required_fields = ["context_tags", "conversation_summary", "what_worked", "what_to_avoid"]
+        if not all(field in memory_data for field in required_fields):
+            logger.error(f"Missing required fields in memory data: {memory_data}")
+            return None
+        
+        # Create complete memory document
+        memory_document = {
+            "episode_id": episode_data["episode_id"],
+            "user_id": episode_data["user_id"],
+            "username": episode_data.get("username"),
+            "created_at": datetime.datetime.now(datetime.timezone.utc),
+            "episode_started_at": episode_data.get("started_at"),
+            "episode_ended_at": episode_data.get("ended_at"),
+            "message_count": len(episode_data.get("messages", [])),
+            "context_tags": memory_data["context_tags"],
+            "conversation_summary": memory_data["conversation_summary"],
+            "what_worked": memory_data["what_worked"],
+            "what_to_avoid": memory_data["what_to_avoid"],
+            "processed": True
+        }
+        
+        return memory_document
+        
+    except Exception as e:
+        logger.error(f"Error creating episodic memory for episode {episode_data.get('episode_id')}: {e}")
+        return None
+
+def save_episodic_memory(memory_document: dict) -> bool:
+    """Save episodic memory to MongoDB (with duplicate checking)"""
+    try:
+        # Check if memory already exists for this episode
+        existing_memory = memory_collection.find_one(
+            {"episode_id": memory_document["episode_id"]},
+            {"_id": 1}  # Only get the ID to check existence
+        )
+        if existing_memory:
+            logger.info(f"Memory already exists for episode {memory_document['episode_id']}")
+            return True
+        
+        # Insert new memory
+        result = memory_collection.insert_one(memory_document)
+        logger.info(f"Saved episodic memory for episode {memory_document['episode_id']}: {result.inserted_id}")
+        return True
+        
+    except Exception as e:
+        logger.error(f"Error saving episodic memory: {e}")
+        return False
+
+def process_completed_episodes():
+    """Process completed episodes that don't have memories yet (with efficient batching)"""
+    try:
+        # Find completed episodes without memories using efficient query
+        # Only get episodes that are ended, have messages, and haven't been processed yet
+        query = {
+            "ended_at": {"$exists": True},
+            "messages": {"$exists": True, "$not": {"$size": 0}},
+            "memory_generated": {"$ne": True}  # Only episodes not yet processed
+        }
+        
+        # Project only necessary fields to reduce memory usage
+        projection = {
+            "episode_id": 1,
+            "user_id": 1,
+            "username": 1,
+            "started_at": 1,
+            "ended_at": 1,
+            "messages": 1
+        }
+        
+        # Use pagination for efficient processing
+        completed_episodes = journal_collection.find(
+            query, 
+            projection
+        ).sort("ended_at", 1).limit(MEMORY_BATCH_SIZE)  # Process oldest first
+        
+        processed_count = 0
+        failed_count = 0
+        
+        for episode in completed_episodes:
+            try:
+                # Create memory
+                memory_document = create_episodic_memory(episode)
+                
+                if memory_document and save_episodic_memory(memory_document):
+                    # Mark episode as processed
+                    journal_collection.update_one(
+                        {"episode_id": episode["episode_id"]},
+                        {"$set": {"memory_generated": True, "memory_processed_at": datetime.datetime.now(datetime.timezone.utc)}}
+                    )
+                    processed_count += 1
+                    logger.info(f"Processed memory for episode {episode['episode_id']}")
+                else:
+                    # Mark as failed but don't retry immediately
+                    journal_collection.update_one(
+                        {"episode_id": episode["episode_id"]},
+                        {"$set": {"memory_generation_failed": True, "memory_failed_at": datetime.datetime.now(datetime.timezone.utc)}}
+                    )
+                    failed_count += 1
+                    logger.warning(f"Failed to process memory for episode {episode['episode_id']}")
+                    
+            except Exception as e:
+                logger.error(f"Error processing episode {episode['episode_id']}: {e}")
+                # Mark as failed
+                journal_collection.update_one(
+                    {"episode_id": episode["episode_id"]},
+                    {"$set": {"memory_generation_failed": True, "memory_failed_at": datetime.datetime.now(datetime.timezone.utc)}}
+                )
+                failed_count += 1
+        
+        if processed_count > 0 or failed_count > 0:
+            logger.info(f"Memory processing cycle: {processed_count} processed, {failed_count} failed")
+            
+    except Exception as e:
+        logger.error(f"Error in process_completed_episodes: {e}")
 
 # --- Gemini Response Generator with Working Memory ---
 def generate_reply_from_gemini(user_input: str, conversation_history: list = None) -> str:
@@ -110,7 +298,8 @@ def transition_state(user_id, username, event):
                 "username": username,
                 "episode_id": new_episode_id,
                 "started_at": now,
-                "messages": []
+                "messages": [],
+                "memory_generated": False  # Flag for memory processing
             })
         elif state == EpisodeState.ACTIVE:
             state_info["last_activity"] = now
@@ -131,7 +320,7 @@ def transition_state(user_id, username, event):
 
     user_states[user_id] = state_info
 
-# --- Background Task to Monitor Timeouts ---
+# --- Background Task to Monitor Timeouts and Process Memories ---
 async def monitor_idle_users():
     logger.info("Starting user idle monitoring...")
     while True:
@@ -142,6 +331,18 @@ async def monitor_idle_users():
                     logger.info(f"User {user_id} timed out, transitioning state...")
                     transition_state(user_id, None, "timeout")
         await asyncio.sleep(60)  # Check every minute
+
+async def process_episodic_memories():
+    """Background task to process completed episodes into episodic memories (with batching)"""
+    logger.info("Starting episodic memory processing...")
+    while True:
+        try:
+            process_completed_episodes()
+        except Exception as e:
+            logger.error(f"Error in episodic memory processing: {e}")
+        
+        # Process memories every 5 minutes
+        await asyncio.sleep(MEMORY_PROCESSING_INTERVAL)
 
 # --- Telegram Bot Handlers ---
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -194,8 +395,9 @@ async def main():
     app.add_handler(CommandHandler("bye", bye))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, save_message))
     
-    # Start the monitoring task in the background
+    # Start background tasks
     monitor_task = asyncio.create_task(monitor_idle_users())
+    memory_task = asyncio.create_task(process_episodic_memories())
     
     try:
         # Initialize and start the bot
@@ -215,6 +417,7 @@ async def main():
     finally:
         # Clean shutdown
         monitor_task.cancel()
+        memory_task.cancel()
         await app.stop()
         await app.shutdown()
 
