@@ -300,36 +300,58 @@ async def process_completed_episodes():
         logger.error(f"Error in process_completed_episodes: {e}")
 
 # --- Gemini Response Generator with Working Memory ---
-async def generate_reply_from_gemini(user_input: str, conversation_history: list = None, user_id: int = None) -> str:
+async def generate_reply_from_gemini(user_input: str, conversation_history: list = None, user_id: int = None, top_k: int = 5) -> str:
     try:
         # --- Future Enhancement: Retrieval Augmented Generation (RAG) ---
         # 1. Embed the user's current query
-        # user_query_embedding = await embed_text_with_gemini(user_input, task_type=glm.TaskType.RETRIEVAL_QUERY)
+        user_query_embedding = await embed_text_with_gemini(user_input, task_type="semantic_similarity")
         
         # 2. Use this embedding to query your episodic_memories collection for similar memories
-        #    This would typically involve a vector search (e.g., using MongoDB Atlas Vector Search)
-        #    retrieved_memories = memory_collection.aggregate([
-        #        {"$vectorSearch": {
-        #            "queryVector": user_query_embedding,
-        #            "path": "embedding", # The field where your embeddings are stored
-        #            "numCandidates": 50, # Number of potential matches to consider
-        #            "limit": 3 # Number of top matches to return
-        #        }},
-        #        {"$project": {"_id": 0, "conversation_summary": 1, "what_worked": 1, "what_to_avoid": 1, "context_tags": 1}}
-        #    ]).to_list()
+        #    This would typically involve a vector search (e.g., using MongoDB Atlas Vector Search) 
+        pipeline = [  
+            {  
+                "$vectorSearch": {  
+                    "index": "vector_index", 
+                    "path": "embedding",
+                    "queryVector": user_query_embedding,   
+                    "numCandidates": 50,   
+                    "limit": 5  
+                }  
+            },  
+            {  
+                "$project":  {
+                    "episode_id": 1,
+                    "user_id": 1,
+                    "username": 1,
+                    "context_tags": 1,
+                    "conversation_summary": 1,
+                    "what_worked": 1,
+                    "what_to_avoid": 1,
+                    "score": {"$meta": "searchScore"}
+                }   
+                
+            }  
+        ]
+        try:
+            results = list(memory_collection.aggregate(pipeline))
+        except Exception as e:
+            logger.error(f"Error executing aggregation pipeline: {e}")
+            return "Sorry, I couldn't retrieve relevant information at the moment."
+        
+        print(results)
         
         # 3. Format retrieved memories to include in the prompt
-        #    memory_context = ""
-        #    if retrieved_memories:
-        #        memory_context = "\n\nRelevant past coaching insights (for context, do not directly quote):\n"
-        #        for mem in retrieved_memories:
-        #            memory_context += f"- Summary: {mem.get('conversation_summary', '')}. Worked: {mem.get('what_worked', '')}. Avoid: {mem.get('what_to_avoid', '')}. Tags: {', '.join(mem.get('context_tags', []))}\n"
+        memory_context = ""
+        if results:
+            memory_context = "\n\nRelevant past coaching insights (for context, do not directly quote):\n"
+            for mem in results:
+                memory_context += f"- Summary: {mem.get('conversation_summary', '')}. Worked: {mem.get('what_worked', '')}. Avoid: {mem.get('what_to_avoid', '')}. Tags: {', '.join(mem.get('context_tags', []))}\n"
 
         # Build conversation context
         context_prompt = "Act as a life coach. Provide thoughtful and empathetic responses to user queries."
         
-        # if memory_context:
-        #    context_prompt += memory_context
+        if memory_context:
+           context_prompt += memory_context
 
         if conversation_history and len(conversation_history) > 0:
             context_prompt += "\n\nHere's the conversation history from this session:\n"
@@ -340,6 +362,8 @@ async def generate_reply_from_gemini(user_input: str, conversation_history: list
             context_prompt += f"\nNow respond to the user's latest message: {user_input}"
         else:
             context_prompt += f"\n\nUser message: {user_input}"
+            
+        print(context_prompt)
         
         model = genai.GenerativeModel('gemini-1.5-flash', system_instruction=context_prompt)
         response = await model.generate_content_async(user_input) # Use async version
