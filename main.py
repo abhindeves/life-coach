@@ -14,6 +14,8 @@ from telegram.ext import (
     ApplicationBuilder, CommandHandler, MessageHandler, ContextTypes, filters
 )
 import google.generativeai as genai
+# Import glm for embedding functionalities
+import google.generativeai.types as glm
 
 # Configure logging
 logging.basicConfig(
@@ -41,12 +43,19 @@ MEMORY_COLLECTION_NAME = 'episodic_memories'
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
 genai.configure(api_key=GEMINI_API_KEY)
 
+# --- Define Gemini Embedding Model ---
+# Using the best available general-purpose embedding model for now
+EMBEDDING_MODEL = "models/embedding-001" 
+
 # --- MongoDB Connection ---
 try:
     client = MongoClient(uri)
     db = client[DB_NAME]
     journal_collection = db[COLLECTION_NAME]
     memory_collection = db[MEMORY_COLLECTION_NAME]
+    # Ensure a vector index is available for future similarity searches if you switch to Atlas Vector Search
+    # For a basic setup, you might not need to define it here, but it's good practice.
+    # If you use Atlas Vector Search, you'd define the index in MongoDB Atlas UI.
     logger.info("Successfully connected to MongoDB!")
 except Exception as e:
     logger.error(f"Error connecting to MongoDB: {e}")
@@ -77,13 +86,13 @@ Review the conversation and create a memory reflection with these rules:
 4. Use terms or phrases directly from the conversation for context_tags when possible.
 Output only a valid JSON object in this format:
 {{
-    "context_tags": [              // 2–4 keywords or phrases lifted directly from the user's concerns or goals
+    "context_tags": [             // 2–4 keywords or phrases lifted directly from the user's concerns or goals
         string,
         ...
     ],
     "conversation_summary": string, // One sentence summarizing the user's main concern or progress
-    "what_worked": string,         // The most effective thing said or done in the conversation
-    "what_to_avoid": string        // The least effective or unhelpful moment in the conversation
+    "what_worked": string,        // The most effective thing said or done in the conversation
+    "what_to_avoid": string       // The least effective or unhelpful moment in the conversation
 }}
 Guidelines:
 - Pull actual keywords or short phrases from the conversation for context_tags, e.g., ["procrastination", "gym_routine", "lack_of_motivation"]
@@ -92,6 +101,22 @@ Guidelines:
 Here is the conversation:
 {conversation}
 """
+
+# --- Embedding Function ---
+async def embed_text_with_gemini(text: str, task_type = "semantic_similarity") -> list:
+    """Generates embeddings for a given text using Gemini embedding model."""
+    try:
+        # The embed_content function is designed for efficient embedding
+        response = await genai.embed_content_async(
+            model=EMBEDDING_MODEL,
+            content=text,
+            task_type=task_type
+        )
+        # The embedding is a list of floats
+        return response['embedding']
+    except Exception as e:
+        logger.error(f"Error generating embedding for text: '{text[:50]}...' Error: {e}")
+        return []
 
 # --- Episodic Memory Functions ---
 def format_conversation_for_memory(messages: list) -> str:
@@ -103,8 +128,11 @@ def format_conversation_for_memory(messages: list) -> str:
         formatted_conversation += f"[{timestamp}] {sender}: {msg['text']}\n"
     return formatted_conversation
 
-def create_episodic_memory(episode_data: dict) -> dict:
-    """Create episodic memory from a completed conversation episode"""
+async def create_episodic_memory(episode_data: dict) -> dict:
+    """
+    Create episodic memory from a completed conversation episode,
+    including generating embeddings for the summary and tags.
+    """
     try:
         # Format conversation for analysis
         conversation_text = format_conversation_for_memory(episode_data.get("messages", []))
@@ -138,6 +166,24 @@ def create_episodic_memory(episode_data: dict) -> dict:
             logger.error(f"Missing required fields in memory data: {memory_data}")
             return None
         
+        # --- Generate Embeddings for Memory Data ---
+        # Combine relevant fields for a comprehensive embedding of the memory
+        combined_memory_text = (
+            f"Summary: {memory_data['conversation_summary']}. "
+            f"Context Tags: {', '.join(memory_data['context_tags'])}. "
+            f"What worked: {memory_data['what_worked']}. "
+            f"What to avoid: {memory_data['what_to_avoid']}."
+        )
+        
+        memory_embedding = await embed_text_with_gemini(
+            combined_memory_text,
+            task_type= "semantic_similarity"# This memory will be retrieved as a document
+        )
+
+        if not memory_embedding:
+            logger.error(f"Failed to generate embedding for episode {episode_data.get('episode_id')}")
+            return None
+
         # Create complete memory document
         memory_document = {
             "episode_id": episode_data["episode_id"],
@@ -151,6 +197,7 @@ def create_episodic_memory(episode_data: dict) -> dict:
             "conversation_summary": memory_data["conversation_summary"],
             "what_worked": memory_data["what_worked"],
             "what_to_avoid": memory_data["what_to_avoid"],
+            "embedding": memory_embedding, # Store the embedding here!
             "processed": True
         }
         
@@ -181,7 +228,7 @@ def save_episodic_memory(memory_document: dict) -> bool:
         logger.error(f"Error saving episodic memory: {e}")
         return False
 
-def process_completed_episodes():
+async def process_completed_episodes():
     """Process completed episodes that don't have memories yet (with efficient batching)"""
     try:
         # Find completed episodes without memories using efficient query
@@ -211,37 +258,41 @@ def process_completed_episodes():
         processed_count = 0
         failed_count = 0
         
-        for episode in completed_episodes:
-            try:
-                # Create memory
-                memory_document = create_episodic_memory(episode)
-                
-                if memory_document and save_episodic_memory(memory_document):
-                    # Mark episode as processed
-                    journal_collection.update_one(
-                        {"episode_id": episode["episode_id"]},
-                        {"$set": {"memory_generated": True, "memory_processed_at": datetime.datetime.now(datetime.timezone.utc)}}
-                    )
-                    processed_count += 1
-                    logger.info(f"Processed memory for episode {episode['episode_id']}")
-                else:
-                    # Mark as failed but don't retry immediately
-                    journal_collection.update_one(
-                        {"episode_id": episode["episode_id"]},
-                        {"$set": {"memory_generation_failed": True, "memory_failed_at": datetime.datetime.now(datetime.timezone.utc)}}
-                    )
-                    failed_count += 1
-                    logger.warning(f"Failed to process memory for episode {episode['episode_id']}")
-                    
-            except Exception as e:
-                logger.error(f"Error processing episode {episode['episode_id']}: {e}")
+        # Collect episodes to process them asynchronously
+        episodes_to_process = list(completed_episodes)
+        
+        # Use asyncio.gather to run memory creation for multiple episodes concurrently
+        memory_creation_tasks = [create_episodic_memory(episode) for episode in episodes_to_process]
+        memory_documents = await asyncio.gather(*memory_creation_tasks, return_exceptions=True)
+
+        for i, memory_document in enumerate(memory_documents):
+            episode = episodes_to_process[i] # Get the original episode data
+            
+            if isinstance(memory_document, Exception):
+                logger.error(f"Error processing episode {episode.get('episode_id')}: {memory_document}")
                 # Mark as failed
                 journal_collection.update_one(
                     {"episode_id": episode["episode_id"]},
                     {"$set": {"memory_generation_failed": True, "memory_failed_at": datetime.datetime.now(datetime.timezone.utc)}}
                 )
                 failed_count += 1
-        
+            elif memory_document and save_episodic_memory(memory_document):
+                # Mark episode as processed
+                journal_collection.update_one(
+                    {"episode_id": episode["episode_id"]},
+                    {"$set": {"memory_generated": True, "memory_processed_at": datetime.datetime.now(datetime.timezone.utc)}}
+                )
+                processed_count += 1
+                logger.info(f"Processed memory for episode {episode['episode_id']}")
+            else:
+                # Mark as failed but don't retry immediately
+                journal_collection.update_one(
+                    {"episode_id": episode["episode_id"]},
+                    {"$set": {"memory_generation_failed": True, "memory_failed_at": datetime.datetime.now(datetime.timezone.utc)}}
+                )
+                failed_count += 1
+                logger.warning(f"Failed to process memory for episode {episode['episode_id']}")
+                        
         if processed_count > 0 or failed_count > 0:
             logger.info(f"Memory processing cycle: {processed_count} processed, {failed_count} failed")
             
@@ -249,11 +300,59 @@ def process_completed_episodes():
         logger.error(f"Error in process_completed_episodes: {e}")
 
 # --- Gemini Response Generator with Working Memory ---
-def generate_reply_from_gemini(user_input: str, conversation_history: list = None) -> str:
+async def generate_reply_from_gemini(user_input: str, conversation_history: list = None, user_id: int = None, top_k: int = 5) -> str:
     try:
+        # --- Future Enhancement: Retrieval Augmented Generation (RAG) ---
+        # 1. Embed the user's current query
+        user_query_embedding = await embed_text_with_gemini(user_input, task_type="semantic_similarity")
+        
+        # 2. Use this embedding to query your episodic_memories collection for similar memories
+        #    This would typically involve a vector search (e.g., using MongoDB Atlas Vector Search) 
+        pipeline = [  
+            {  
+                "$vectorSearch": {  
+                    "index": "vector_index", 
+                    "path": "embedding",
+                    "queryVector": user_query_embedding,   
+                    "numCandidates": 50,   
+                    "limit": 5  
+                }  
+            },  
+            {  
+                "$project":  {
+                    "episode_id": 1,
+                    "user_id": 1,
+                    "username": 1,
+                    "context_tags": 1,
+                    "conversation_summary": 1,
+                    "what_worked": 1,
+                    "what_to_avoid": 1,
+                    "score": {"$meta": "searchScore"}
+                }   
+                
+            }  
+        ]
+        try:
+            results = list(memory_collection.aggregate(pipeline))
+        except Exception as e:
+            logger.error(f"Error executing aggregation pipeline: {e}")
+            return "Sorry, I couldn't retrieve relevant information at the moment."
+        
+        print(results)
+        
+        # 3. Format retrieved memories to include in the prompt
+        memory_context = ""
+        if results:
+            memory_context = "\n\nRelevant past coaching insights (for context, do not directly quote):\n"
+            for mem in results:
+                memory_context += f"- Summary: {mem.get('conversation_summary', '')}. Worked: {mem.get('what_worked', '')}. Avoid: {mem.get('what_to_avoid', '')}. Tags: {', '.join(mem.get('context_tags', []))}\n"
+
         # Build conversation context
         context_prompt = "Act as a life coach. Provide thoughtful and empathetic responses to user queries."
         
+        if memory_context:
+           context_prompt += memory_context
+
         if conversation_history and len(conversation_history) > 0:
             context_prompt += "\n\nHere's the conversation history from this session:\n"
             for msg in conversation_history:
@@ -263,9 +362,11 @@ def generate_reply_from_gemini(user_input: str, conversation_history: list = Non
             context_prompt += f"\nNow respond to the user's latest message: {user_input}"
         else:
             context_prompt += f"\n\nUser message: {user_input}"
+            
+        print(context_prompt)
         
         model = genai.GenerativeModel('gemini-1.5-flash', system_instruction=context_prompt)
-        response = model.generate_content(user_input)
+        response = await model.generate_content_async(user_input) # Use async version
         return response.text.strip()
     except Exception as e:
         logger.error(f"Error generating reply from Gemini: {e}")
@@ -332,12 +433,12 @@ async def monitor_idle_users():
                     transition_state(user_id, None, "timeout")
         await asyncio.sleep(60)  # Check every minute
 
-async def process_episodic_memories():
+async def process_episodic_memories_task(): # Renamed to avoid confusion with the internal function
     """Background task to process completed episodes into episodic memories (with batching)"""
     logger.info("Starting episodic memory processing...")
     while True:
         try:
-            process_completed_episodes()
+            await process_completed_episodes() # Await this now that it's async
         except Exception as e:
             logger.error(f"Error in episodic memory processing: {e}")
         
@@ -376,7 +477,8 @@ async def save_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     conversation_history = get_episode_history(episode_id)
     
     # Get Gemini reply with working memory context
-    gemini_reply = generate_reply_from_gemini(message_text, conversation_history)
+    # Pass user_id for potential future RAG implementation specific to the user
+    gemini_reply = await generate_reply_from_gemini(message_text, conversation_history, user_id) 
     await update.message.reply_text(gemini_reply)
 
     # Save bot reply
@@ -397,7 +499,8 @@ async def main():
     
     # Start background tasks
     monitor_task = asyncio.create_task(monitor_idle_users())
-    memory_task = asyncio.create_task(process_episodic_memories())
+    # Use the renamed async function for the background task
+    memory_task = asyncio.create_task(process_episodic_memories_task()) 
     
     try:
         # Initialize and start the bot
