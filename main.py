@@ -63,6 +63,10 @@ class EpisodeState(Enum):
 user_states = defaultdict(dict)
 IDLE_TIMEOUT = datetime.timedelta(minutes=30)
 
+# --- Memory Processing Configuration ---
+MEMORY_BATCH_SIZE = 10  # Process max 10 episodes per cycle
+MEMORY_PROCESSING_INTERVAL = 60  # 1 minutes
+
 # --- Episodic Memory Prompt Template ---
 life_coach_prompt_template = """
 You are analyzing life coaching conversations to create memory reflections that help guide future sessions. Your job is to extract helpful insights that reflect the user's core issues, goals, and what coaching strategies worked or didn't.
@@ -157,10 +161,13 @@ def create_episodic_memory(episode_data: dict) -> dict:
         return None
 
 def save_episodic_memory(memory_document: dict) -> bool:
-    """Save episodic memory to MongoDB"""
+    """Save episodic memory to MongoDB (with duplicate checking)"""
     try:
         # Check if memory already exists for this episode
-        existing_memory = memory_collection.find_one({"episode_id": memory_document["episode_id"]})
+        existing_memory = memory_collection.find_one(
+            {"episode_id": memory_document["episode_id"]},
+            {"_id": 1}  # Only get the ID to check existence
+        )
         if existing_memory:
             logger.info(f"Memory already exists for episode {memory_document['episode_id']}")
             return True
@@ -175,32 +182,71 @@ def save_episodic_memory(memory_document: dict) -> bool:
         return False
 
 def process_completed_episodes():
-    """Process all completed episodes that don't have memories yet"""
+    """Process completed episodes that don't have memories yet (with efficient batching)"""
     try:
-        # Find completed episodes without memories
-        completed_episodes = journal_collection.find({
+        # Find completed episodes without memories using efficient query
+        # Only get episodes that are ended, have messages, and haven't been processed yet
+        query = {
             "ended_at": {"$exists": True},
-            "messages": {"$exists": True, "$not": {"$size": 0}}
-        })
+            "messages": {"$exists": True, "$not": {"$size": 0}},
+            "memory_generated": {"$ne": True}  # Only episodes not yet processed
+        }
+        
+        # Project only necessary fields to reduce memory usage
+        projection = {
+            "episode_id": 1,
+            "user_id": 1,
+            "username": 1,
+            "started_at": 1,
+            "ended_at": 1,
+            "messages": 1
+        }
+        
+        # Use pagination for efficient processing
+        completed_episodes = journal_collection.find(
+            query, 
+            projection
+        ).sort("ended_at", 1).limit(MEMORY_BATCH_SIZE)  # Process oldest first
         
         processed_count = 0
-        for episode in completed_episodes:
-            # Check if memory already exists
-            existing_memory = memory_collection.find_one({"episode_id": episode["episode_id"]})
-            if existing_memory:
-                continue
-            
-            # Create and save memory
-            memory_document = create_episodic_memory(episode)
-            if memory_document and save_episodic_memory(memory_document):
-                processed_count += 1
-                logger.info(f"Processed memory for episode {episode['episode_id']}")
+        failed_count = 0
         
-        if processed_count > 0:
-            logger.info(f"Processed {processed_count} new episodic memories")
+        for episode in completed_episodes:
+            try:
+                # Create memory
+                memory_document = create_episodic_memory(episode)
+                
+                if memory_document and save_episodic_memory(memory_document):
+                    # Mark episode as processed
+                    journal_collection.update_one(
+                        {"episode_id": episode["episode_id"]},
+                        {"$set": {"memory_generated": True, "memory_processed_at": datetime.datetime.now(datetime.timezone.utc)}}
+                    )
+                    processed_count += 1
+                    logger.info(f"Processed memory for episode {episode['episode_id']}")
+                else:
+                    # Mark as failed but don't retry immediately
+                    journal_collection.update_one(
+                        {"episode_id": episode["episode_id"]},
+                        {"$set": {"memory_generation_failed": True, "memory_failed_at": datetime.datetime.now(datetime.timezone.utc)}}
+                    )
+                    failed_count += 1
+                    logger.warning(f"Failed to process memory for episode {episode['episode_id']}")
+                    
+            except Exception as e:
+                logger.error(f"Error processing episode {episode['episode_id']}: {e}")
+                # Mark as failed
+                journal_collection.update_one(
+                    {"episode_id": episode["episode_id"]},
+                    {"$set": {"memory_generation_failed": True, "memory_failed_at": datetime.datetime.now(datetime.timezone.utc)}}
+                )
+                failed_count += 1
+        
+        if processed_count > 0 or failed_count > 0:
+            logger.info(f"Memory processing cycle: {processed_count} processed, {failed_count} failed")
             
     except Exception as e:
-        logger.error(f"Error processing completed episodes: {e}")
+        logger.error(f"Error in process_completed_episodes: {e}")
 
 # --- Gemini Response Generator with Working Memory ---
 def generate_reply_from_gemini(user_input: str, conversation_history: list = None) -> str:
@@ -252,7 +298,8 @@ def transition_state(user_id, username, event):
                 "username": username,
                 "episode_id": new_episode_id,
                 "started_at": now,
-                "messages": []
+                "messages": [],
+                "memory_generated": False  # Flag for memory processing
             })
         elif state == EpisodeState.ACTIVE:
             state_info["last_activity"] = now
@@ -286,7 +333,7 @@ async def monitor_idle_users():
         await asyncio.sleep(60)  # Check every minute
 
 async def process_episodic_memories():
-    """Background task to process completed episodes into episodic memories"""
+    """Background task to process completed episodes into episodic memories (with batching)"""
     logger.info("Starting episodic memory processing...")
     while True:
         try:
@@ -295,7 +342,7 @@ async def process_episodic_memories():
             logger.error(f"Error in episodic memory processing: {e}")
         
         # Process memories every 5 minutes
-        await asyncio.sleep(300)
+        await asyncio.sleep(MEMORY_PROCESSING_INTERVAL)
 
 # --- Telegram Bot Handlers ---
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
