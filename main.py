@@ -315,7 +315,7 @@ async def generate_reply_from_gemini(user_input: str, conversation_history: list
                     "path": "embedding",
                     "queryVector": user_query_embedding,   
                     "numCandidates": 50,   
-                    "limit": 5  
+                    "limit": 2  
                 }  
             },  
             {  
@@ -327,28 +327,33 @@ async def generate_reply_from_gemini(user_input: str, conversation_history: list
                     "conversation_summary": 1,
                     "what_worked": 1,
                     "what_to_avoid": 1,
-                    "score": {"$meta": "searchScore"}
+                    "score": {"$meta": "vectorSearchScore"}
                 }   
                 
             }  
         ]
+        score_threshold = 0.8  # Adjust based on your needs
         try:
             results = list(memory_collection.aggregate(pipeline))
+            results = [res for res in results if res.get("score", 0) >= score_threshold]
+            if len(results) == 0:
+                results = [{"conversation_summary": "", "what_worked": "", "what_to_avoid": "", "context_tags": []}]
         except Exception as e:
             logger.error(f"Error executing aggregation pipeline: {e}")
             return "Sorry, I couldn't retrieve relevant information at the moment."
-        
-        print(results)
-        
+
         # 3. Format retrieved memories to include in the prompt
         memory_context = ""
         if results:
             memory_context = "\n\nRelevant past coaching insights (for context, do not directly quote):\n"
-            for mem in results:
-                memory_context += f"- Summary: {mem.get('conversation_summary', '')}. Worked: {mem.get('what_worked', '')}. Avoid: {mem.get('what_to_avoid', '')}. Tags: {', '.join(mem.get('context_tags', []))}\n"
+            if len(results) == 1 and results[0].get("conversation_summary") == "":
+                memory_context += ""
+            else:
+                for mem in results:
+                    memory_context += f"- Summary: {mem.get('conversation_summary', '')}. Worked: {mem.get('what_worked', '')}. Avoid: {mem.get('what_to_avoid', '')}. Tags: {', '.join(mem.get('context_tags', []))}\n"
 
         # Build conversation context
-        context_prompt = "Act as a life coach. Provide thoughtful and empathetic responses to user queries."
+        context_prompt = "Act as a life coach. Provide thoughtful and empathetic responses to user queries.\n\nAlways Try to reference to the user's past experiences. and insights from previous conversations. If there is no Previous conversations give then start fresh.\n\n"
         
         if memory_context:
            context_prompt += memory_context
