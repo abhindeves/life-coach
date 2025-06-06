@@ -1,14 +1,26 @@
 # Life Coach Telegram Bot
 
-A conversational life coach bot that uses Gemini AI for responses and stores conversations in MongoDB for journaling purposes.
+A conversational life coach bot that uses Gemini AI for responses and stores conversations in MongoDB for journaling purposes, with advanced memory and context capabilities.
 
 ## Features
 
-- AI-powered life coaching via Telegram
-- Conversation history stored in MongoDB
-- Session management with timeout handling
-- Context-aware responses using conversation history
-- Simple state machine for session tracking
+- **AI-powered life coaching** via Telegram using Gemini 1.5 Flash
+- **Episodic Memory System** that:
+  - Stores conversation insights with context tags and summaries
+  - Uses vector embeddings for semantic search
+  - Implements Retrieval Augmented Generation (RAG)
+- **Advanced State Management**:
+  - Finite State Machine (FSM) for session tracking
+  - Background tasks for memory processing
+  - Automatic timeout handling (30 minutes inactive)
+- **Conversation Processing**:
+  - Batch processing of completed conversations
+  - Automatic memory generation for each session
+  - Context-aware responses using past conversations
+- **Technical Infrastructure**:
+  - Asynchronous processing for better performance
+  - Robust error handling and logging
+  - Efficient MongoDB queries and indexing
 
 ## Requirements
 
@@ -63,4 +75,12 @@ The bot can be configured via environment variables:
 - python-dotenv
 - python-telegram-bot
 
-*This README will be updated as the project evolves.*
+## Work in Progress
+
+This project is under active development with ongoing improvements to:
+- Memory retrieval and context handling
+- Conversation analysis quality
+- Performance optimizations
+- User experience enhancements
+
+New features are being tested and refined regularly.
