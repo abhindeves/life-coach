@@ -350,7 +350,7 @@ async def generate_reply_from_gemini(user_input: str, conversation_history: list
                     memory_context += f"- Summary: {mem.get('conversation_summary', '')}. Worked: {mem.get('what_worked', '')}. Avoid: {mem.get('what_to_avoid', '')}. Tags: {', '.join(mem.get('context_tags', []))}\n"
 
         # Build conversation context
-        context_prompt = "Act as a life coach. Provide thoughtful and empathetic responses to user queries.\n\nAlways Try to reference to the user's past experiences. and insights from previous conversations. If there is no Previous conversations give then start fresh.\n\n"
+        context_prompt = "Act as a life coach. Provide thoughtful and empathetic responses to user queries.\n\nAlways Try to reference to the user's past experiences. and insights from previous conversations. If there is no Previous conversations give then start fresh.\n\nMake Sure to keep the message very short and concise.\n\n"
         
         if memory_context:
            context_prompt += memory_context
