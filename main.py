@@ -335,9 +335,8 @@ async def generate_reply_from_gemini(user_input: str, conversation_history: list
         score_threshold = 0.8  # Adjust based on your needs
         try:
             results = list(memory_collection.aggregate(pipeline))
-            results = [res for res in results if res.get("score", 0) >= score_threshold]
-            if len(results) == 0:
-                results = [{"conversation_summary": "", "what_worked": "", "what_to_avoid": "", "context_tags": []}]
+            filtered_results = [res for res in results if res.get("score", 0) >= score_threshold]
+            results = filtered_results if filtered_results else []
         except Exception as e:
             logger.error(f"Error executing aggregation pipeline: {e}")
             return "Sorry, I couldn't retrieve relevant information at the moment."
@@ -346,10 +345,8 @@ async def generate_reply_from_gemini(user_input: str, conversation_history: list
         memory_context = ""
         if results:
             memory_context = "\n\nRelevant past coaching insights (for context, do not directly quote):\n"
-            if len(results) == 1 and results[0].get("conversation_summary") == "":
-                memory_context += ""
-            else:
-                for mem in results:
+            for mem in results:
+                if mem.get("conversation_summary"):  # Only add non-empty summaries
                     memory_context += f"- Summary: {mem.get('conversation_summary', '')}. Worked: {mem.get('what_worked', '')}. Avoid: {mem.get('what_to_avoid', '')}. Tags: {', '.join(mem.get('context_tags', []))}\n"
 
         # Build conversation context
